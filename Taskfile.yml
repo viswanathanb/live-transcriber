@@ -1,0 +1,45 @@
+version: '3'
+
+vars:
+  WHISPER_MODEL: '{{.WHISPER_MODEL | default "~/models/whisper/kb-whisper-large-q5_0.bin"}}'
+  WHISPER_PORT: '{{.WHISPER_PORT | default "8178"}}'
+  WHISPER_JA_MODEL: '{{.WHISPER_JA_MODEL | default "~/models/whisper/ggml-large-v3-turbo.bin"}}'
+  WHISPER_JA_PORT: '{{.WHISPER_JA_PORT | default "8179"}}'
+
+tasks:
+  live:
+    desc: 'Live transcript TUI of the microphone (args after --, e.g. task live -- p1)'
+    cmd: cargo run --release -q -- {{.CLI_ARGS}}
+
+  whisper:
+    desc: Run both transcription servers (Swedish :8178, multilingual :8179)
+    deps: [whisper:sv, whisper:ja]
+
+  whisper:sv:
+    desc: whisper.cpp whisper-server for Swedish (brew install whisper-cpp; KBLab kb-whisper model)
+    cmd: whisper-server -m {{.WHISPER_MODEL}} -l sv --host 0.0.0.0 --port {{.WHISPER_PORT}}
+
+  whisper:ja:
+    desc: whisper.cpp whisper-server for Japanese and other languages (multilingual large-v3-turbo model)
+    cmd: whisper-server -m {{.WHISPER_JA_MODEL}} -l ja --host 0.0.0.0 --port {{.WHISPER_JA_PORT}}
+
+  build:
+    desc: Build the release binary into target/release/live-transcriber
+    cmd: cargo build --release
+
+  test:
+    desc: Run tests
+    cmd: cargo test
+
+  lint:
+    desc: Formatting and clippy
+    cmds:
+      - cargo fmt --check
+      - cargo clippy --all-targets -- -D warnings
+
+  check:
+    desc: Everything that should pass before calling a change done
+    cmds:
+      - task: lint
+      - task: test
+      - task: build

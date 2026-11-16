@@ -1,0 +1,23 @@
+[package]
+name = "live-transcriber"
+version = "0.1.0"
+edition = "2024"
+description = "Terminal UI that transcribes the microphone or a live audio stream with a whisper.cpp whisper-server"
+
+[[bin]]
+name = "live-transcriber"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+cpal = "0.18.2"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
