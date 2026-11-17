@@ -6,11 +6,12 @@ mod audio;
 mod channels;
 mod engine;
 mod player;
+mod stats;
 mod ui;
 mod whisper;
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -45,7 +46,7 @@ struct Args {
     lang: Option<String>,
     /// Least new audio (seconds) before the next Whisper pass; higher means less
     /// GPU load. Default: 0.3, or with playback what the delay leaves room for
-    /// (delay − 1.5 s, at most 20 s).
+    /// (delay − 5 s, at most 20 s).
     #[arg(long)]
     step: Option<f64>,
     /// Commit text after this many seconds even if no sentence has ended.
@@ -97,6 +98,7 @@ fn main() -> Result<()> {
     let (audio_tx, audio_rx) = mpsc::channel();
     let (ev_tx, ev_rx) = mpsc::channel();
     let level = Arc::new(AtomicU32::new(0));
+    let received = Arc::new(AtomicU64::new(0));
     // The microphone isn't played back: it would echo.
     let player = match source {
         Source::Url(_) if !args.no_play => Some(player::open(args.delay.max(0.5))?),
@@ -105,16 +107,27 @@ fn main() -> Result<()> {
     let clock = player.as_ref().map(|p| p.clock.clone());
     // Played audio is read at playback speed, or a file would decode ahead and be skipped.
     let realtime = args.realtime || player.is_some();
-    let _input = audio::start(&source, realtime, clock.clone(), audio_tx, level.clone())?;
-    // A word must be transcribed before it plays: within one step plus a pass (~1 s).
-    let step = args.step.unwrap_or(match &clock {
-        Some(c) => (c.delay_secs - 1.5).clamp(0.3, 20.0),
-        None => 0.3,
-    });
+    let _input = audio::start(
+        &source,
+        realtime,
+        clock.clone(),
+        audio_tx,
+        level.clone(),
+        received.clone(),
+    )?;
+    // A word must be transcribed before it plays: a pass starts MARGIN seconds
+    // before its oldest new audio plays, and takes about a second.
+    let step = args
+        .step
+        .unwrap_or(match &clock {
+            Some(c) => (c.delay_secs - engine::MARGIN).clamp(0.3, 20.0),
+            None => 0.3,
+        })
+        .max(0.1);
     engine::spawn(
         whisper::Whisper::new(&args.whisper, &lang),
         engine::Config {
-            step: step.max(0.1),
+            step,
             max_pending: args.max_pending,
             silence: args.silence,
         },
@@ -127,13 +140,18 @@ fn main() -> Result<()> {
         source: source.label(),
         lang,
         whisper: args.whisper.clone(),
+        step,
     };
     let mut terminal = ratatui::init();
     let res = ui::run(
         &mut terminal,
         info,
         ev_rx,
-        level,
+        ui::Meters {
+            level,
+            received,
+            load: stats::spawn(Duration::from_secs(1)),
+        },
         clock,
         Duration::from_millis(50),
     );

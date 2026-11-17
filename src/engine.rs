@@ -3,6 +3,11 @@
 //! Sentences that have ended are committed and their audio dropped; the rest
 //! stays pending so Whisper hears a cut-off sentence whole on the next pass.
 //! Words carry their times on the stream's timeline, for delayed playback.
+//!
+//! The audio sent to Whisper is a sliding window: the last CONTEXT seconds of
+//! audio that was already committed, then the new audio. Whisper hears the
+//! lead-in to the new words, and words it hears again in the context are
+//! dropped. The next window fills while Whisper works on this one.
 
 use std::sync::LazyLock;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -39,6 +44,15 @@ pub enum Event {
     Commit(Vec<Word>),
     /// The not yet final rest, replacing the previous partial.
     Partial(Vec<Word>),
+    /// A window of audio was taken: `context` seconds already committed, then
+    /// `new` seconds, ending at `upto` on the stream's timeline. Unless it is
+    /// `quiet` (skipped), it goes to Whisper now.
+    Window {
+        context: f64,
+        new: f64,
+        upto: f64,
+        quiet: bool,
+    },
     /// A Whisper pass finished. `lag` is how long ago the newest audio in it
     /// arrived; `upto` is where that audio ends on the stream's timeline.
     Pass {
@@ -52,11 +66,15 @@ pub enum Event {
 }
 
 /// Hard cap: Whisper's window is 30 s.
-const MAX_BUFFER: f64 = 28.0;
+pub const MAX_BUFFER: f64 = 28.0;
 /// Trailing quiet this long ends an utterance (mic pauses, talk-radio breaks).
 const PAUSE: f64 = 0.6;
 /// Seconds of audio kept before the next word when audio is dropped.
 const OVERLAP: f64 = 0.4;
+/// Seconds of already committed audio at the start of each window.
+const CONTEXT: f64 = 5.0;
+/// With playback, a pass starts this many seconds before its oldest new audio plays.
+pub const MARGIN: f64 = 5.0;
 
 pub fn spawn(whisper: Whisper, cfg: Config, audio: Receiver<Vec<i16>>, ui: Sender<Event>) {
     thread::spawn(move || run(whisper, cfg, audio, ui));
@@ -75,11 +93,12 @@ fn run(whisper: Whisper, cfg: Config, audio: Receiver<Vec<i16>>, ui: Sender<Even
     let cap = samples(MAX_BUFFER);
     let mut buf: Vec<i16> = Vec::with_capacity(cap);
     let mut offset = 0.0; // seconds from the start of the audio to buf[0]
+    let mut ctx = 0; // samples at the start of buf that are committed context
     let mut eof = false;
     let mut said: Vec<String> = Vec::new(); // the last committed words, normalised
     let mut newest = Instant::now();
 
-    while !eof || !buf.is_empty() {
+    while !eof || buf.len() > ctx {
         // Wait for a step of new audio, then take everything that queued up
         // during the last pass (or a podcast's backlog) up to the cap, so
         // passes run back to back.
@@ -107,14 +126,25 @@ fn run(whisper: Whisper, cfg: Config, audio: Receiver<Vec<i16>>, ui: Sender<Even
 
         // All quiet: nothing to say, and Whisper hallucinates on silence. The
         // last bit is kept in case a word is just starting.
-        if loudest(&buf) < cfg.silence {
-            let drop = buf.len().saturating_sub(samples(OVERLAP));
+        let quiet = loudest(&buf[ctx..]) < cfg.silence;
+        if quiet || buf.len() - ctx >= SAMPLE_RATE / 2 || eof {
+            let _ = ui.send(Event::Window {
+                context: secs(ctx),
+                new: secs(buf.len() - ctx),
+                upto: offset + secs(buf.len()),
+                quiet,
+            });
+        }
+        if quiet {
+            let keep = if eof { 0 } else { samples(OVERLAP) };
+            let drop = buf.len().saturating_sub(keep);
             buf.drain(..drop);
             offset += secs(drop);
+            ctx = ctx.saturating_sub(drop);
             let _ = ui.send(Event::Partial(Vec::new()));
             continue;
         }
-        if buf.len() < SAMPLE_RATE / 2 && !eof {
+        if buf.len() - ctx < SAMPLE_RATE / 2 && !eof {
             continue;
         }
 
@@ -126,30 +156,33 @@ fn run(whisper: Whisper, cfg: Config, audio: Receiver<Vec<i16>>, ui: Sender<Even
                 if buf.len() >= cap {
                     offset += secs(buf.len());
                     buf.clear();
+                    ctx = 0;
                 }
                 thread::sleep(Duration::from_millis(500));
                 continue;
             }
         };
         let dur = secs(buf.len());
+        let pending = secs(buf.len() - ctx);
         let _ = ui.send(Event::Pass {
             took: t.elapsed(),
-            pending: dur,
+            pending,
             lag: newest.elapsed(),
             upto: offset + dur,
         });
 
         let tail = &buf[buf.len().saturating_sub(samples(PAUSE))..];
-        let paused = dur > 1.5 && rms(tail) < cfg.silence;
+        let paused = pending > 1.5 && rms(tail) < cfg.silence;
         let done = eof || paused || buf.len() >= cap;
 
         if segs.is_empty() {
             // Nothing recognised yet: a word may just be starting, so keep the
             // audio unless it has gone on too long (music).
             let _ = ui.send(Event::Partial(Vec::new()));
-            if done || dur > cfg.max_pending {
+            if done || pending > cfg.max_pending {
                 offset += dur;
                 buf.clear();
+                ctx = 0;
             }
             continue;
         }
@@ -157,26 +190,32 @@ fn run(whisper: Whisper, cfg: Config, audio: Receiver<Vec<i16>>, ui: Sender<Even
         let cut = if done {
             segs.len()
         } else {
-            commit_point(&segs, dur, cfg.max_pending)
+            commit_point(&segs, dur, pending, cfg.max_pending)
         };
+        // Words in the context were committed by an earlier pass.
+        let from = offset + secs(ctx);
+        let mut partial = new_words(&segs[cut..], offset, from);
         if cut > 0 {
-            let mut words = words_of(&segs[..cut], offset);
+            let mut words = new_words(&segs[..cut], offset, from);
             words.drain(..repeated(&said, &words));
             if !words.is_empty() {
                 remember(&mut said, &words);
                 let _ = ui.send(Event::Commit(words));
             }
-            // Keep a little audio before the pending rest: its start time can be
-            // late, and words heard twice are stripped by strip_repeat.
-            let drop = if cut == segs.len() {
+            // The pending rest starts a little early: its start time can be
+            // late, and words heard twice are stripped by `repeated`. Before
+            // it, CONTEXT seconds of committed audio are kept.
+            let edge = if cut == segs.len() {
                 buf.len()
             } else {
-                samples(segs[cut].start - OVERLAP).min(buf.len())
-            };
+                samples(segs[cut].start - OVERLAP)
+            }
+            .clamp(ctx, buf.len());
+            let drop = edge.saturating_sub(samples(CONTEXT));
             buf.drain(..drop);
             offset += secs(drop);
+            ctx = edge - drop;
         }
-        let mut partial = words_of(&segs[cut..], offset);
         partial.drain(..repeated(&said, &partial));
         let _ = ui.send(Event::Partial(partial));
     }
@@ -186,14 +225,15 @@ fn run(whisper: Whisper, cfg: Config, audio: Receiver<Vec<i16>>, ui: Sender<Even
 /// Number of segments that are final: up to the last sentence end that is not
 /// right at the edge of the audio (it may still grow), never starting the
 /// pending rest mid-word. Long run-ons commit all but the last segment.
-fn commit_point(segs: &[Segment], dur: f64, max_pending: f64) -> usize {
+/// `dur` is the whole window, `pending` the part after the context.
+fn commit_point(segs: &[Segment], dur: f64, pending: f64, max_pending: f64) -> usize {
     let mut cut = 0;
     for (i, s) in segs.iter().enumerate() {
         if ends_sentence(&s.text) && s.end < dur - 0.3 {
             cut = i + 1;
         }
     }
-    if cut == 0 && dur > max_pending && segs.len() > 1 {
+    if cut == 0 && pending > max_pending && segs.len() > 1 {
         cut = segs.len() - 1;
     }
     while cut > 0 && cut < segs.len() && !starts_word(&segs[cut].text) {
@@ -268,6 +308,13 @@ fn words_of(segs: &[Segment], offset: f64) -> Vec<Word> {
     out
 }
 
+/// The words of `segs` that are mostly after `from`, on the stream's timeline.
+fn new_words(segs: &[Segment], offset: f64, from: f64) -> Vec<Word> {
+    let mut words = words_of(segs, offset);
+    words.retain(|w| (w.start + w.end) / 2.0 >= from);
+    words
+}
+
 fn loudest(buf: &[i16]) -> f32 {
     buf.chunks(SAMPLE_RATE / 10).map(rms).fold(0.0, f32::max)
 }
@@ -329,13 +376,28 @@ mod tests {
             seg(2.0, 4.0, " Hur mår"),
             seg(4.0, 5.0, " du"),
         ];
-        assert_eq!(commit_point(&segs, 6.0, 10.0), 1);
+        assert_eq!(commit_point(&segs, 6.0, 6.0, 10.0), 1);
     }
 
     #[test]
     fn keeps_sentence_at_the_edge_pending() {
         let segs = [seg(0.0, 2.0, " Hej."), seg(2.0, 5.9, " Hur mår du?")];
-        assert_eq!(commit_point(&segs, 6.0, 10.0), 1);
+        assert_eq!(commit_point(&segs, 6.0, 6.0, 10.0), 1);
+    }
+
+    #[test]
+    fn context_does_not_count_as_pending() {
+        let segs = [seg(0.0, 5.0, " och sedan"), seg(5.0, 11.0, " gick vi")];
+        assert_eq!(commit_point(&segs, 12.0, 7.0, 10.0), 0);
+        assert_eq!(commit_point(&segs, 12.0, 11.0, 10.0), 1);
+    }
+
+    #[test]
+    fn drops_words_heard_in_the_context() {
+        let segs = [seg(0.0, 4.8, " Hej."), seg(4.9, 6.0, " Hur")];
+        let w = new_words(&segs, 10.0, 15.0);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].text, " Hur");
     }
 
     #[test]
@@ -345,7 +407,7 @@ mod tests {
             seg(5.0, 9.0, " gick vi"),
             seg(9.0, 11.0, "ut"),
         ];
-        assert_eq!(commit_point(&segs, 12.0, 10.0), 1);
+        assert_eq!(commit_point(&segs, 12.0, 12.0, 10.0), 1);
     }
 
     fn words(text: &str) -> Vec<Word> {

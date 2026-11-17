@@ -3,7 +3,7 @@
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread;
 
@@ -43,13 +43,14 @@ impl Drop for Input {
 /// samples. The sender is dropped when the audio ends. With `play`, the audio
 /// is decoded at the output's rate and channels, queued for playback, and
 /// resampled for Whisper. `level` holds the RMS of the latest block (0..1, as
-/// f32 bits) for the level meter.
+/// f32 bits) for the level meter; `received` counts the samples sent.
 pub fn start(
     src: &Source,
     realtime: bool,
     play: Option<Arc<Clock>>,
     tx: Sender<Vec<i16>>,
     level: Arc<AtomicU32>,
+    received: Arc<AtomicU64>,
 ) -> Result<Input> {
     let (rate, channels) = play
         .as_ref()
@@ -125,6 +126,7 @@ pub fn start(
                 .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
                 .collect();
             level.store(rms(&pcm).to_bits(), Ordering::Relaxed);
+            received.fetch_add(pcm.len() as u64, Ordering::Relaxed);
             if tx.send(pcm).is_err() {
                 return;
             }

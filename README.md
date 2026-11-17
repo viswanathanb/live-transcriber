@@ -9,15 +9,21 @@ It can also transcribe a radio channel, a stream URL or an audio file. These are
 as you hear it, like subtitles, with the word being spoken highlighted.
 
 ```
-┌ Sveriges Radio P1 ─────────────────────────────────────────────────────────────────┐
-│ Playing   ▮▮▮▮▮▮▮▮▮▮▮▮      lang sv  lag 0.8s  whisper 790 ms  pending 10.2s       │
-│ buffer ██████████████████████████████ 19.9 / 20.0 s   text ready 12.4 s   ▶ 03:12  │
-└ https://live1.sr.se/132-aac-320 → http://localhost:8178 ───────────────────────────┘
-
-┌ Transcript ────────────────────────────────────────────────────────────────────────┐
-│03:05  Idag pratar vi om vädret i Stockholm.                                        │
-│03:08  Det blir soligt men kallt under hela veckan och på lördag                    │
-└────────────────────────────────────────────────────────────────────────────────────┘
+┌ Sveriges Radio P1 ─────────────────────────────────────────────┐┌ System ────────────────────────┐
+│ status    Playing               lang     sv                    ││ cpu   ███░░░░░░░  34%          │
+│ input    ▮▮▮▮▮▮▮▮▮▮             whisper  790 ms                ││ gpu   █████░░░░░  47%          │
+│ lag      0.8 s                  pending  10.2 s                ││ mem   ████░░░░░░  19.2/48.0 GB │
+│ position 03:12                  step     15.0 s                ││ vram  █░░░░░░░░░  2.9 GB       │
+└ https://live1.sr.se/132-aac-320 → http://localhost:8178 ───────┘└────────────────────────────────┘
+┌ Buffers ─────────────────────────────────────────────────────────────────────────────────────────┐
+│ playback  ██████████████████████████████  19.9 / 20.0 s   12.4 s text ready                      │
+│ window    █████████████████████░░░░░░░░░   5.0 + 15.2 s   ✓ done                                 │
+│ next      ████████████░░░░░░░░░░░░░░░░░░   6.1 / 15.0 s                                          │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Transcript ──────────────────────────────────────────────────────────────────────────────────────┐
+│03:05  Idag pratar vi om vädret i Stockholm.                                                      │
+│03:08  Det blir soligt men kallt under hela veckan och på lördag                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Requirements
@@ -112,7 +118,9 @@ played back, since that would echo.
 ### Choosing the delay (streams and files)
 
 `--delay` sets how far behind the stream playback runs. Each Whisper pass handles about
-`delay − 1.5` seconds of new audio (at most 20 s).
+`delay − 5` seconds of new audio (at most 20 s). A pass starts 5 seconds before its oldest new audio plays, so
+the text is ready before playback gets there. Each pass also re-sends the last 5 seconds of audio that was
+already transcribed, so Whisper hears the lead-in to the new words. Words it hears again are dropped.
 
 | `--delay` | What you get                                                                      |
 | --------- | --------------------------------------------------------------------------------- |
@@ -126,13 +134,26 @@ the text is ready 17.6 s before it plays:
 
 ![btop showing the GPU at about 47% and CPU at about 34% while live-transcriber plays P4 with a 20 s delay](docs/load-delay-20.png)
 
-The **buffer** meter in the header shows the playback buffer against the delay. Green is audio that
+The header has three panels. The stream panel shows the status and Whisper's timings. The system
+panel is on the right, and the buffers panel is underneath.
+
+The **playback** bar in the buffers panel shows the playback buffer against the delay. Green is audio that
 already has its text, yellow is still waiting for Whisper, and gray hasn't arrived yet. Once
 playback starts the bar should stay full. If it turns mostly yellow, Whisper is falling behind and
 you need a longer delay or a smaller model.
 
-The microphone (and `--no-play`) has no delay or buffer meter: text shows as soon as it is
-transcribed.
+The **window** bar shows the latest audio window sent to Whisper, on a scale of 28 s (Whisper's
+limit). Blue is the overlap with the previous window, which was already transcribed. Magenta is the new
+audio. The label shows whether Whisper is still working on it, has finished, or skipped it because it
+was quiet. The **next** bar shows the following window filling up while Whisper works. When it is
+full, the next pass starts. The numbers are colored to match the bars.
+
+The microphone (and `--no-play`) has no delay or playback bar: text shows as soon as it is
+transcribed. The window and next bars are always shown.
+
+The **System** panel shows the whole Mac's CPU, GPU and memory use, refreshed every second. "vram" is
+the memory the GPU is using. The gauges turn yellow above 60% and red above 85%. GPU use and GPU memory come from `ioreg`, the same counters
+Activity Monitor uses, and need no sudo.
 
 ## Keys
 
@@ -145,8 +166,8 @@ transcribed.
 | `↑` `↓` `PgUp` `PgDn` | Scroll back through the whole transcript                |
 | `End` / `G`          | Back to the live page                                    |
 
-The transcript is shown a page at a time. When it reaches the bottom, the screen clears and continues
-from the top. Scrolling and saving still cover everything.
+The transcript is shown a page at a time. When it fills 80% of the screen, the screen clears and
+continues from the top with the line being played. Scrolling and saving still cover everything.
 
 ## Options
 
